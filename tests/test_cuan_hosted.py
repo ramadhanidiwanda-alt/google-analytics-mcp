@@ -5,7 +5,8 @@ import pytest
 from starlette.testclient import TestClient
 
 from analytics_mcp.hosted_runtime import (CuanGa4Control, HostedGa4Error,
-                                          HostedGa4Service, READ_SCOPE, EDIT_SCOPE)
+                                          HostedGa4Service, READ_SCOPE, EDIT_SCOPE,
+                                          digest)
 from analytics_mcp.hosted_server import PrivateIngress, create_app, create_hosted_server
 
 KEY = "ci_mcp_ck_" + "a" * 64
@@ -18,19 +19,26 @@ class Control:
         self.claimed = False
         self.final = None
         self.grant_ref = "ref:1"
+        self.revision = "rev:1"
+        self.grant_id = "grant:1"
+        self.after_resolve = None
 
     async def call(self, key, action, request):
         assert key == KEY
         self.actions.append((action, request))
         if action == "authorize":
             write = request["operation"] == "update_key_event"
-            return {"allowed": True, "provider": "google_analytics", **request,
+            grant = {"allowed": True, "provider": "google_analytics", **request,
                     "scope": EDIT_SCOPE if write else READ_SCOPE,
                     "disposableTestProperty": write, "ownedTestProperty": write,
-                    "grantId": "grant:1", "policyRevision": "rev:1",
+                    "grantId": self.grant_id, "policyRevision": self.revision,
                     "credentialRef": self.grant_ref}
+            if self.after_resolve is not None and any(a == "resolveCredential" for a, _ in self.actions):
+                grant.update(self.after_resolve)
+            return grant
         if action == "resolveCredential":
             assert request["credentialRef"] == self.grant_ref
+            assert request["operation"] in ("run_daily_report", "update_key_event")
             return {"accessToken": "ephemeral"}
         if action == "issuePreview":
             return {**request, "previewId": "preview:1", "confirmationToken": "confirm:1"}
@@ -77,6 +85,7 @@ async def test_report_is_bounded_and_rechecks_cuan():
     assert await service.run_daily_report(KEY, "123", "2026-09-30", "2026-09-30") == {
         "propertyId": "123", "rows": [{"date": "2026-09-30", "activeUsers": 7}], "rowCount": 1}
     assert [a for a, _ in control.actions] == ["authorize", "resolveCredential"]
+    assert control.actions[1][1]["operation"] == "run_daily_report"
     with pytest.raises(HostedGa4Error):
         await service.run_daily_report(KEY, "123", "2026-01-01", "2026-02-02")
     with pytest.raises(HostedGa4Error):
@@ -92,6 +101,9 @@ async def test_preview_claim_finalize_and_replay_denied():
         "ONCE_PER_EVENT", "ONCE_PER_SESSION")
     assert len(preview["requestDigest"]) == 64
     assert preview["expiresAt"] == 1_300_000
+    assert [a for a, _ in control.actions[:4]] == [
+        "authorize", "resolveCredential", "authorize", "issuePreview"]
+    assert control.actions[1][1]["operation"] == "update_key_event"
     result = await service.execute(KEY, "123", "456", "purchase_test",
         "ONCE_PER_EVENT", "ONCE_PER_SESSION", preview["previewId"],
         preview["confirmationToken"], preview["expiresAt"], "execute_123", True)
@@ -191,6 +203,42 @@ def test_stateless_mcp_transports_connection_key_to_tool():
                                               if k != "x-cuan-ga4-ingress-secret"}, json=call)
         assert denied.status_code == 403
     assert [a for a, _ in control.actions] == ["authorize", "resolveCredential"]
+
+
+@pytest.mark.asyncio
+async def test_preview_uses_policy_revision_after_token_refresh():
+    control, google = Control(), Google()
+    control.after_resolve = {"policyRevision": "rev:2"}
+    service = HostedGa4Service(control, google, now=lambda: 1_000_000)
+    preview = await service.preview(KEY, "123", "456", "purchase_test",
+        "ONCE_PER_EVENT", "ONCE_PER_SESSION")
+    change = service.validate_change("123", "456", "purchase_test",
+        "ONCE_PER_EVENT", "ONCE_PER_SESSION")
+    assert preview["requestDigest"] == digest(change, {
+        "policyRevision": "rev:2", "grantId": "grant:1", "credentialRef": "ref:1"
+    }, preview["expiresAt"])
+    assert [a for a, _ in control.actions] == [
+        "authorize", "resolveCredential", "authorize", "issuePreview"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [
+    {"grantId": "grant:2"},
+    {"credentialRef": "ref:2"},
+    {"ownedTestProperty": False},
+    {"scope": READ_SCOPE},
+])
+async def test_preview_denies_changed_grant_before_issuing(changed):
+    control, google = Control(), Google()
+    control.after_resolve = changed
+    service = HostedGa4Service(control, google, now=lambda: 1_000_000)
+    with pytest.raises(HostedGa4Error) as exc:
+        await service.preview(KEY, "123", "456", "purchase_test",
+            "ONCE_PER_EVENT", "ONCE_PER_SESSION")
+    assert exc.value.code == "NOT_AUTHORIZED"
+    assert [a for a, _ in control.actions] == [
+        "authorize", "resolveCredential", "authorize"]
+    assert google.writes == 0
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,12 @@ def binding_equal(actual: dict, expected: dict) -> bool:
     return all(actual.get(key) == value for key, value in expected.items())
 
 
+def same_grant_identity(before: dict, after: dict) -> bool:
+    fields = ("provider", "operation", "propertyId", "keyEventId", "scope",
+              "disposableTestProperty", "ownedTestProperty", "grantId", "credentialRef")
+    return all(before.get(field) == after.get(field) for field in fields)
+
+
 def digest(change: dict, grant: dict, expires_at: int) -> str:
     values = ["update_key_event", change["propertyId"], change["keyEventId"],
               change["expectedEventName"], change["expectedCountingMethod"],
@@ -149,7 +155,8 @@ class HostedGa4Service:
 
     async def token(self, key: str, property_id: str, grant: dict) -> str:
         result = await self.control.call(key, "resolveCredential",
-            {"provider": "google_analytics", "propertyId": property_id,
+            {"provider": "google_analytics", "operation": grant["operation"],
+             "propertyId": property_id,
              "credentialRef": grant["credentialRef"]})
         token = result.get("accessToken")
         if not isinstance(token, str) or not token or len(token) > 8192:
@@ -219,9 +226,12 @@ class HostedGa4Service:
         change = self.validate_change(property_id, event_id, event_name, old, new)
         grant = await self.grant(key, "update_key_event", property_id, event_id)
         token = await self.token(key, property_id, grant)
+        refreshed_grant = await self.grant(key, "update_key_event", property_id, event_id)
+        if not same_grant_identity(grant, refreshed_grant):
+            raise deny()
         self.assert_preconditions(await self.read_event(token, change), change)
         expiry = self.now() + PREVIEW_TTL_MS
-        binding = {**change, "requestDigest": digest(change, grant, expiry), "expiresAt": expiry}
+        binding = {**change, "requestDigest": digest(change, refreshed_grant, expiry), "expiresAt": expiry}
         preview = await self.control.call(key, "issuePreview", binding)
         if not binding_equal(preview, binding) or not opaque(preview.get("previewId")) or not opaque(preview.get("confirmationToken")) or preview.get("expiresAt", 0) <= self.now():
             raise deny()
