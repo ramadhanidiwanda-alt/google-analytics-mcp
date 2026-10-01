@@ -205,3 +205,25 @@ Here are some sample prompts to get you started:
 ## Contributing ✨
 
 Contributions welcome! See the [Contributing Guide](CONTRIBUTING.md).
+
+## Cuan private hosted mode
+
+`Dockerfile.cuan` starts a separate stateless HTTP MCP service on `/mcp`. It does
+not import the upstream ADC/coordinator entry point. It exposes only daily GA4
+active-user reports (31 days maximum) and a custom key-event counting-method
+change on an owned disposable test property. Writes require a Cuan preview,
+explicit confirmation, one-time claim, provider readback, and Cuan finalization.
+
+Set `CUAN_GA4_RUNTIME_URL` (HTTPS), `GA4_PRIVATE_SERVICE_ID`,
+`GA4_PRIVATE_SERVICE_SECRET`, `GA4_INGRESS_SECRET` (at least 32 characters),
+and `GA4_MCP_ALLOWED_HOST` (one exact external Host header, including port if
+present).
+Keep the service behind private ingress. Every MCP POST must include
+`x-cuan-ga4-ingress-secret` and a Cuan `x-cuan-mcp-connection-key`. Cuan keeps
+refresh tokens; this service receives only a short-lived access token for each
+operation. Hosted mode does not accept ADC or user-supplied Google API URLs.
+The Cuan GA4 runtime must be deployed and enabled separately; it is default-off.
+The hosted image installs only MCP/HTTP dependencies, so Google ADK and ADC are
+absent from this execution path. The upstream stdio command remains available
+for its existing use. Run focused hosted tests with `pytest` and
+`pytest-asyncio` installed: `python -m pytest -q tests/test_cuan_hosted.py`.
