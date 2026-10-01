@@ -1,0 +1,10 @@
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PORT=8080
+WORKDIR /app
+COPY analytics_mcp ./analytics_mcp
+RUN pip install --no-cache-dir 'mcp>=1.24.0,<2' 'httpx>=0.28.1,<1' 'uvicorn>=0.30,<1' && \
+    groupadd --system --gid 10001 cuan && \
+    useradd --system --uid 10001 --gid 10001 --no-create-home cuan
+USER 10001:10001
+EXPOSE 8080
+CMD ["python", "-m", "analytics_mcp.hosted_server"]
