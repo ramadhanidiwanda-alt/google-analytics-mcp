@@ -1,16 +1,81 @@
 """Focused hosted-mode contract tests; never contact Cuan or Google."""
 
 import httpx
+import hashlib
+import json
+from unittest.mock import AsyncMock
 import pytest
 from starlette.testclient import TestClient
 
 from analytics_mcp.hosted_runtime import (CuanGa4Control, HostedGa4Error,
                                           HostedGa4Service, READ_SCOPE, EDIT_SCOPE,
-                                          digest)
+                                          digest, UnifiedGa4Service)
 from analytics_mcp.hosted_server import PrivateIngress, create_app, create_hosted_server
 
 KEY = "ci_mcp_ck_" + "a" * 64
 SECRET = "s" * 32
+
+
+def unified_invocation(tool, args, resource="123"):
+    raw = json.dumps(args, separators=(",", ":"), ensure_ascii=False)
+    return {"version": 1, "publicTool": tool, "provider": "google_analytics", "resourceId": resource,
+            "canonicalArgumentsJson": raw, "digest": hashlib.sha256(raw.encode()).hexdigest(),
+            "executionId": "execution_123", "permit": "p" * 43}
+
+
+@pytest.mark.asyncio
+async def test_unified_traffic_reports_active_users_without_summing_rows():
+    google = AsyncMock()
+    google.request.return_value = {"rows": [
+        {"dimensionValues": [{"value": "google"}, {"value": "organic"}],
+         "metricValues": [{"value": "7"}, {"value": "9"}]},
+        {"dimensionValues": [{"value": "direct"}, {"value": "none"}],
+         "metricValues": [{"value": "5"}, {"value": "6"}]}]}
+    service = UnifiedGa4Service("https://cuan.example/redeem", "service", SECRET, google)
+    service._redeem = AsyncMock(return_value={"ok": True, "provider": "google_analytics",
+        "resourceId": "123", "providerTarget": "properties/123", "accessToken": "transient"})
+    service._finalize = AsyncMock()
+    result = await service.invoke("google_analytics_get_traffic_report", unified_invocation(
+        "google_analytics_get_traffic_report", {"accountId": "123", "since": "2026-09-01", "until": "2026-09-02", "limit": 100}))
+    assert result["rows"][0] == {"sessionSource": "google", "sessionMedium": "organic", "activeUsers": 7, "sessions": 9}
+    assert "totalActiveUsers" not in result
+    google.request.assert_awaited_once()
+    service._finalize.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unified_digest_mismatch_does_not_redeem_or_call_google():
+    google = AsyncMock()
+    service = UnifiedGa4Service("https://cuan.example/redeem", "service", SECRET, google)
+    service._redeem = AsyncMock()
+    invocation = unified_invocation("google_analytics_run_daily_report", {"accountId": "123", "since": "2026-09-01", "until": "2026-09-02"})
+    invocation["canonicalArgumentsJson"] += " "
+    with pytest.raises(HostedGa4Error):
+        await service.invoke("google_analytics_run_daily_report", invocation)
+    service._redeem.assert_not_awaited()
+    google.request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unified_key_event_timeout_finalizes_unknown_once():
+    google = AsyncMock()
+    google.key_event.return_value = {"name": "properties/123/keyEvents/456", "eventName": "purchase",
+                                     "countingMethod": "ONCE_PER_EVENT"}
+    google.update_event.side_effect = TimeoutError("provider timeout")
+    service = UnifiedGa4Service("https://cuan.example/redeem", "service", SECRET, google)
+    service._redeem = AsyncMock(return_value={"ok": True, "provider": "google_analytics",
+        "resourceId": "123", "providerTarget": "properties/123", "accessToken": "transient",
+        "previewId": "preview-123", "approvalDigest": "a" * 64})
+    service._finalize = AsyncMock()
+    invocation = unified_invocation("google_analytics_update_key_event", {"accountId": "123",
+        "keyEventId": "456", "expectedEventName": "purchase", "expectedCountingMethod": "ONCE_PER_EVENT",
+        "newCountingMethod": "ONCE_PER_SESSION", "confirmed": True,
+        "previewId": "preview-123", "approvalDigest": "a" * 64})
+    with pytest.raises(HostedGa4Error) as exc:
+        await service.invoke("google_analytics_update_key_event", invocation)
+    assert exc.value.code == "UNKNOWN_OUTCOME"
+    google.update_event.assert_awaited_once()
+    service._finalize.assert_awaited_once_with(invocation, "failed_after_dispatch")
 
 
 class Control:
