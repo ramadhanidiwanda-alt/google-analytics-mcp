@@ -123,12 +123,12 @@ class GoogleGa4Rest:
 
     async def key_event(self, token: str, property_id: str, event_id: str) -> dict:
         return await self.request(token, "GET",
-            f"https://analyticsadmin.googleapis.com/v1beta/properties/{property_id}/keyEvents/{event_id}")
+            f"https://analyticsadmin.googleapis.com/v1alpha/properties/{property_id}/keyEvents/{event_id}")
 
     async def update_event(self, token: str, property_id: str, event_id: str, method: str) -> dict:
         name = f"properties/{property_id}/keyEvents/{event_id}"
         return await self.request(token, "PATCH",
-            f"https://analyticsadmin.googleapis.com/v1beta/{name}?updateMask=counting_method",
+            f"https://analyticsadmin.googleapis.com/v1alpha/{name}?updateMask=counting_method",
             {"name": name, "countingMethod": method})
 
 
@@ -147,9 +147,7 @@ class HostedGa4Service:
             grant.get("operation") != operation or grant.get("propertyId") != property_id or
             grant.get("keyEventId") != event_id or grant.get("scope") !=
             (READ_SCOPE if operation == "run_daily_report" else EDIT_SCOPE) or
-            not all(opaque(grant.get(field)) for field in ("grantId", "policyRevision", "credentialRef")) or
-            (operation == "update_key_event" and (grant.get("disposableTestProperty") is not True or
-                                                  grant.get("ownedTestProperty") is not True))):
+            not all(opaque(grant.get(field)) for field in ("grantId", "policyRevision", "credentialRef"))):
             raise deny()
         return grant
 
@@ -211,7 +209,7 @@ class HostedGa4Service:
     async def read_event(self, token: str, change: dict) -> dict:
         data = await self.google.key_event(token, change["propertyId"], change["keyEventId"])
         if (data.get("name") != f'properties/{change["propertyId"]}/keyEvents/{change["keyEventId"]}' or
-            data.get("custom") is not True or not isinstance(data.get("eventName"), str) or
+            not isinstance(data.get("eventName"), str) or
             data.get("countingMethod") not in METHODS):
             raise HostedGa4Error("PROVIDER_RESPONSE_INVALID", "GA4 key event was invalid")
         return data
@@ -289,3 +287,195 @@ class HostedGa4Service:
         return {"propertyId": property_id, "keyEventId": event_id,
                 "eventName": event_name, "oldCountingMethod": old, "countingMethod": new,
                 "restoreCountingMethod": old, "executionId": execution_id}
+
+
+class UnifiedGa4Service:
+    """Redeem a centrally claimed permit, then make one bounded Google request."""
+
+    TOOLS = {"google_analytics_list_properties", "google_analytics_run_daily_report",
+             "google_analytics_get_traffic_report", "google_analytics_list_key_events",
+             "google_analytics_preview_key_event_update", "google_analytics_update_key_event"}
+
+    def __init__(self, endpoint: str, service_id: str, service_secret: str,
+                 google: GoogleGa4Rest, client: httpx.AsyncClient | None = None):
+        if not endpoint.startswith("https://") or not service_id or len(service_secret) < 32:
+            raise ValueError("Cuan GA4 redeem configuration invalid")
+        self.endpoint, self.service_id, self.service_secret, self.google = endpoint, service_id, service_secret, google
+        self.client = client or httpx.AsyncClient(timeout=10.0, follow_redirects=False)
+
+    @staticmethod
+    def _args(tool: str, invocation: Any) -> dict:
+        if (tool not in UnifiedGa4Service.TOOLS or not isinstance(invocation, dict) or
+            set(invocation) != {"version", "publicTool", "provider", "resourceId",
+                                "canonicalArgumentsJson", "digest", "executionId", "permit"} or
+            invocation.get("version") != 1 or invocation.get("publicTool") != tool or
+            invocation.get("provider") != "google_analytics" or
+            not isinstance(invocation.get("resourceId"), str) or
+            not isinstance(invocation.get("canonicalArgumentsJson"), str) or
+            not isinstance(invocation.get("digest"), str) or
+            not re.fullmatch(r"[0-9a-f]{64}", invocation["digest"]) or
+            not isinstance(invocation.get("executionId"), str) or
+            not EXECUTION.fullmatch(invocation["executionId"]) or
+            not isinstance(invocation.get("permit"), str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", invocation["permit"])):
+            raise deny()
+        raw = invocation["canonicalArgumentsJson"].encode("utf-8")
+        if len(raw) > 65536 or hashlib.sha256(raw).hexdigest() != invocation["digest"]:
+            raise deny()
+        try:
+            args = json.loads(raw)
+        except ValueError:
+            raise invalid() from None
+        if not isinstance(args, dict):
+            raise invalid()
+        if tool == "google_analytics_list_properties":
+            if invocation["resourceId"]:
+                raise deny()
+        elif args.get("accountId") != invocation["resourceId"]:
+            raise deny()
+        return args
+
+    async def _redeem(self, invocation: dict) -> dict:
+        try:
+            response = await self.client.post(self.endpoint, json={"googleInvocation": invocation},
+                headers={"x-cuan-ga4-service-id": self.service_id,
+                         "x-cuan-ga4-service-secret": self.service_secret})
+            response.raise_for_status()
+            value = response.json()
+        except (httpx.HTTPError, ValueError):
+            raise deny() from None
+        if not isinstance(value, dict) or value.get("ok") is not True or value.get("provider") != "google_analytics" or value.get("resourceId") != invocation["resourceId"]:
+            raise deny()
+        return value
+
+    async def _finalize(self, invocation: dict, outcome: str) -> None:
+        endpoint = self.endpoint.rsplit("/", 1)[0] + "/mcp-finalize-execution"
+        try:
+            response = await self.client.post(endpoint, json={"executionId": invocation["executionId"],
+                "permit": invocation["permit"], "outcome": outcome},
+                headers={"x-cuan-ga4-service-id": self.service_id,
+                         "x-cuan-ga4-service-secret": self.service_secret})
+            response.raise_for_status()
+            value = response.json()
+        except (httpx.HTTPError, ValueError):
+            raise HostedGa4Error("FINALIZATION_UNKNOWN", "Cuan GA4 finalization unavailable; inspect before retrying") from None
+        if not isinstance(value, dict) or value.get("ok") is not True:
+            raise HostedGa4Error("FINALIZATION_UNKNOWN", "Cuan GA4 finalization denied; inspect before retrying")
+
+    @staticmethod
+    def _range(args: dict) -> tuple[str, str, int, int]:
+        since, until, limit = args.get("since"), args.get("until"), args.get("limit", 100)
+        try:
+            start, end = date.fromisoformat(since), date.fromisoformat(until)
+            if start.isoformat() != since or end.isoformat() != until or not 0 <= (end-start).days <= 30:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise invalid() from None
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise invalid()
+        prefix = hashlib.sha256(f"{args['accountId']}:{since}:{until}:{limit}".encode()).hexdigest()[:16]
+        cursor = args.get("cursor")
+        if cursor is None:
+            offset = 0
+        else:
+            match = re.fullmatch(rf"{prefix}:([0-9]{{1,7}})", cursor) if isinstance(cursor, str) else None
+            if match is None:
+                raise invalid()
+            offset = int(match.group(1))
+        return since, until, limit, offset
+
+    async def invoke(self, tool: str, invocation: dict) -> dict:
+        state = {"validated": False, "redeemed": False, "mutation_dispatched": False}
+        try:
+            result = await self._invoke(tool, invocation, state)
+        except Exception:
+            if state["validated"]:
+                await self._finalize(invocation, "failed_after_dispatch" if state["mutation_dispatched"] else "failed_before_dispatch")
+            raise
+        if state["redeemed"]:
+            await self._finalize(invocation, "succeeded")
+        return result
+
+    async def _invoke(self, tool: str, invocation: dict, state: dict[str, bool]) -> dict:
+        args = self._args(tool, invocation)
+        state["validated"] = True
+        grant = await self._redeem(invocation)
+        state["redeemed"] = True
+        if tool == "google_analytics_list_properties":
+            resources = grant.get("resources")
+            if not isinstance(resources, list):
+                raise deny()
+            return {"properties": resources}
+        property_id = numeric(invocation["resourceId"])
+        if grant.get("providerTarget") != f"properties/{property_id}":
+            raise deny()
+        token = grant.get("accessToken")
+        if not isinstance(token, str) or not token or len(token) > 8192:
+            raise deny()
+        if tool in ("google_analytics_run_daily_report", "google_analytics_get_traffic_report"):
+            since, until, limit, offset = self._range(args)
+            dimensions = ["date"] if tool.endswith("daily_report") else ["sessionSource", "sessionMedium"]
+            metrics = ["activeUsers"] if tool.endswith("daily_report") else ["activeUsers", "sessions"]
+            response = await self.google.request(token, "POST",
+                f"https://analyticsdata.googleapis.com/v1beta/properties/{property_id}:runReport",
+                {"dateRanges": [{"startDate": since, "endDate": until}],
+                 "dimensions": [{"name": name} for name in dimensions],
+                 "metrics": [{"name": name} for name in metrics],
+                 "limit": str(limit), "offset": str(offset)})
+            rows = response.get("rows", [])
+            if not isinstance(rows, list) or len(rows) > limit:
+                raise HostedGa4Error("PROVIDER_RESPONSE_INVALID", "GA4 report rows invalid")
+            output = []
+            for row in rows:
+                try:
+                    dims = [item["value"] for item in row["dimensionValues"]]
+                    vals = [int(item["value"]) for item in row["metricValues"]]
+                    if len(dims) != len(dimensions) or len(vals) != len(metrics) or any(v < 0 for v in vals):
+                        raise ValueError()
+                    item = dict(zip(dimensions, dims)) | dict(zip(metrics, vals))
+                    if "date" in item:
+                        raw_date = item["date"]
+                        if not re.fullmatch(r"\d{8}", raw_date):
+                            raise ValueError()
+                        item["date"] = date(int(raw_date[:4]), int(raw_date[4:6]), int(raw_date[6:8])).isoformat()
+                    output.append(item)
+                except (KeyError, TypeError, ValueError, IndexError):
+                    raise HostedGa4Error("PROVIDER_RESPONSE_INVALID", "GA4 report row invalid") from None
+            prefix = hashlib.sha256(f"{property_id}:{since}:{until}:{limit}".encode()).hexdigest()[:16]
+            return {"propertyId": property_id, "rows": output,
+                    "nextCursor": f"{prefix}:{offset+limit}" if len(output) == limit else None}
+        if tool == "google_analytics_list_key_events":
+            result = await self.google.request(token, "GET",
+                f"https://analyticsadmin.googleapis.com/v1alpha/properties/{property_id}/keyEvents?pageSize=100")
+            events = result.get("keyEvents", [])
+            if not isinstance(events, list) or len(events) > 100:
+                raise HostedGa4Error("PROVIDER_RESPONSE_INVALID", "GA4 key events invalid")
+            return {"propertyId": property_id, "keyEvents": events,
+                    "nextPageToken": result.get("nextPageToken")}
+        change = HostedGa4Service.validate_change(property_id, args.get("keyEventId"),
+            args.get("expectedEventName"), args.get("expectedCountingMethod"), args.get("newCountingMethod"))
+        service = HostedGa4Service(None, self.google)
+        current = await service.read_event(token, change)
+        service.assert_preconditions(current, change)
+        if tool == "google_analytics_preview_key_event_update":
+            if not isinstance(grant.get("previewId"), str) or not grant["previewId"] or \
+                not isinstance(grant.get("approvalDigest"), str) or not re.fullmatch(r"[0-9a-f]{64}", grant["approvalDigest"]):
+                raise deny()
+            return {**change, "requiresConfirmation": True, "restoreCountingMethod": change["expectedCountingMethod"],
+                    "previewId": grant["previewId"], "approvalDigest": grant["approvalDigest"]}
+        if args.get("confirmed") is not True:
+            raise HostedGa4Error("CONFIRMATION_REQUIRED", "Explicit GA4 update confirmation required")
+        if grant.get("previewId") != args.get("previewId") or grant.get("approvalDigest") != args.get("approvalDigest") or \
+            not isinstance(args.get("previewId"), str) or not isinstance(args.get("approvalDigest"), str) or \
+            not re.fullmatch(r"[0-9a-f]{64}", args["approvalDigest"]):
+            raise deny()
+        try:
+            state["mutation_dispatched"] = True
+            updated = await self.google.update_event(token, property_id, change["keyEventId"], change["newCountingMethod"])
+            after = await service.read_event(token, change)
+        except Exception:
+            raise HostedGa4Error("UNKNOWN_OUTCOME", "GA4 key event outcome unknown; inspect before retrying") from None
+        if updated.get("countingMethod") != change["newCountingMethod"] or after.get("countingMethod") != change["newCountingMethod"]:
+            raise HostedGa4Error("UNKNOWN_OUTCOME", "GA4 key event outcome unknown; inspect before retrying")
+        return {**change, "countingMethod": change["newCountingMethod"],
+                "restoreCountingMethod": change["expectedCountingMethod"],
+                "executionId": invocation["executionId"]}

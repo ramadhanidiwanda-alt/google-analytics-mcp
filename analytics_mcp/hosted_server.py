@@ -14,7 +14,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from analytics_mcp.hosted_runtime import (KEY, CuanGa4Control, GoogleGa4Rest,
-                                          HostedGa4Error, HostedGa4Service)
+                                          HostedGa4Error, HostedGa4Service, UnifiedGa4Service)
 
 _connection_key: contextvars.ContextVar[str] = contextvars.ContextVar("cuan_ga4_connection_key", default="")
 
@@ -24,7 +24,13 @@ def create_hosted_server(control: Any = None, google: Any = None,
     if control is None:
         control = CuanGa4Control(os.environ["CUAN_GA4_RUNTIME_URL"],
             os.environ["GA4_PRIVATE_SERVICE_ID"], os.environ["GA4_PRIVATE_SERVICE_SECRET"])
-    service = HostedGa4Service(control, google or GoogleGa4Rest())
+    google = google or GoogleGa4Rest()
+    service = HostedGa4Service(control, google)
+    redeem_url = os.environ.get("CUAN_GA4_REDEEM_URL")
+    if not redeem_url and os.environ.get("CUAN_GA4_RUNTIME_URL"):
+        redeem_url = os.environ["CUAN_GA4_RUNTIME_URL"].rsplit("/", 1)[0] + "/mcp-redeem-google-permit"
+    unified = UnifiedGa4Service(redeem_url,
+        os.environ["GA4_PRIVATE_SERVICE_ID"], os.environ["GA4_PRIVATE_SERVICE_SECRET"], google) if redeem_url else None
     hosts = [allowed_host] if allowed_host else ["127.0.0.1:*", "localhost:*"]
     server = FastMCP("Cuan Google Analytics", json_response=True, stateless_http=True,
                      max_request_body_size=65536, max_sessions=100,
@@ -37,6 +43,44 @@ def create_hosted_server(control: Any = None, google: Any = None,
         if not KEY.fullmatch(value):
             raise ValueError("Cuan Connection Key is missing")
         return value
+
+    async def invoke_unified(tool: str, googleInvocation: dict) -> dict:
+        if _connection_key.get() or unified is None:
+            raise ValueError("Cuan GA4 private invocation denied")
+        try:
+            return await unified.invoke(tool, googleInvocation)
+        except HostedGa4Error as exc:
+            raise ValueError(f"{exc.code}: {exc}") from None
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    async def google_analytics_list_properties(googleInvocation: dict) -> dict:
+        """List only allocated GA4 properties in the Cuan grant."""
+        return await invoke_unified("google_analytics_list_properties", googleInvocation)
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    async def google_analytics_run_daily_report(googleInvocation: dict) -> dict:
+        """Read daily active users for one allocated GA4 property."""
+        return await invoke_unified("google_analytics_run_daily_report", googleInvocation)
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    async def google_analytics_get_traffic_report(googleInvocation: dict) -> dict:
+        """Read source and medium traffic with active users and sessions."""
+        return await invoke_unified("google_analytics_get_traffic_report", googleInvocation)
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    async def google_analytics_list_key_events(googleInvocation: dict) -> dict:
+        """List key events for an allocated property."""
+        return await invoke_unified("google_analytics_list_key_events", googleInvocation)
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    async def google_analytics_preview_key_event_update(googleInvocation: dict) -> dict:
+        """Preview a bounded key event counting update."""
+        return await invoke_unified("google_analytics_preview_key_event_update", googleInvocation)
+
+    @server.tool(annotations=ToolAnnotations(destructiveHint=True))
+    async def google_analytics_update_key_event(googleInvocation: dict) -> dict:
+        """Update a key event after central claim and confirmation."""
+        return await invoke_unified("google_analytics_update_key_event", googleInvocation)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def analytics_run_daily_report(property_id: str, since: str, until: str) -> dict:
@@ -94,7 +138,7 @@ class PrivateIngress:
         key = headers.get(b"x-cuan-mcp-connection-key", b"").decode("ascii", "ignore")
         length = headers.get(b"content-length", b"0")
         allowed = (scope["type"] == "http" and scope.get("path") == "/mcp" and
-                   scope.get("method") == "POST" and KEY.fullmatch(key) is not None and
+                   scope.get("method") == "POST" and (not key or KEY.fullmatch(key) is not None) and
                    hmac.compare_digest(supplied, self.secret) and
                    length.isdigit() and int(length) <= 65536)
         if not allowed:
